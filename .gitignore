@@ -1,0 +1,15 @@
+# Dependency directories
+node_modules/
+
+# Checkpoint and diff artifacts
+checkpoint-*.json
+checkpoint-crawl.json
+diff-report.json
+
+# Scratch scripts and experimental dumps
+scratch/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+*.log
