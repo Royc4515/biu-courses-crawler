@@ -17,6 +17,86 @@
   const DELAY_MS = 1500;
   const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
+  // Stops the crawl when the site pushes back. Stopping is the only response: never retry
+  // or work around a block. Verbatim copy of block-detect.js (this script cannot require it).
+  // >>> block-detect (keep identical in block-detect.js and browser-crawl.js)
+  const BIU_COURSES_HOST = 'courses.biu.ac.il';
+  const BLOCK_STATUSES = [403, 429];
+  // Radware Bot Manager injects its connector script (perfdrive / stormcaster.js) into normal
+  // pages too, so the HTML is matched only on text that appears on the challenge page itself.
+  const BLOCK_MARKERS = [
+    { reason: 'hcaptcha', pattern: /h-captcha|hcaptcha\.com/i },
+    { reason: 'radware', pattern: /radware/i, titleOnly: true },
+    { reason: 'radware', pattern: /radware page|verifying your browser/i },
+    { reason: 'captcha', pattern: /captcha/i },
+    {
+      reason: 'block-page',
+      pattern: /access denied|request (?:was )?(?:blocked|rejected)|you have been blocked|unusual traffic|הגישה נחסמה|הבקשה נחסמה/i
+    }
+  ];
+  const BLOCK_MESSAGE_HE =
+    'הסריקה נעצרה: אתר הקורסים של בר-אילן חסם את הבקשות או הציג בדיקת CAPTCHA. ' +
+    'אל תנסו לעקוף את החסימה ואל תריצו את הסורק שוב עכשיו. ' +
+    'הנתונים שנאספו עד כה נשמרו.';
+
+  function isBiuUrl(url) {
+    try {
+      return new URL(url, `https://${BIU_COURSES_HOST}/`).hostname === BIU_COURSES_HOST;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  // fetchError: an in-page fetch() that rejected. A cross-origin redirect to a challenge
+  // host fails CORS before its URL can be read, so a failed request also stops the crawl.
+  function detectBlock({ status, url, title, html, fetchError } = {}) {
+    if (fetchError) {
+      return { reason: 'fetch-failed', detail: String(fetchError) };
+    }
+    if (BLOCK_STATUSES.includes(status)) {
+      return { reason: `http-${status}`, detail: `HTTP ${status}` };
+    }
+    if (url && !isBiuUrl(url)) {
+      return { reason: 'off-site-redirect', detail: url };
+    }
+    const fullText = `${title || ''}\n${html || ''}`;
+    for (const { reason, pattern, titleOnly } of BLOCK_MARKERS) {
+      const hit = (titleOnly ? title || '' : fullText).match(pattern);
+      if (hit) return { reason, detail: hit[0] };
+    }
+    return null;
+  }
+
+  function formatBlockMessage(block, savedTo) {
+    const where = savedTo ? ` (${savedTo})` : '';
+    return `${BLOCK_MESSAGE_HE}${where}\nסיבה: ${block.reason} — ${block.detail}`;
+  }
+
+  class CrawlBlockedError extends Error {
+    constructor(block) {
+      super(`Crawl stopped by the site: ${block.reason} (${block.detail})`);
+      this.name = 'CrawlBlockedError';
+      this.block = block;
+    }
+  }
+  // <<< block-detect
+
+  // Every request goes through here, so a block page is never parsed as course data.
+  async function fetchChecked(url, init) {
+    let res;
+    let html;
+    try {
+      res = await fetch(url, init);
+      html = await res.text();
+    } catch (err) {
+      throw new CrawlBlockedError(detectBlock({ fetchError: String(err) }));
+    }
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const block = detectBlock({ status: res.status, url: res.url, title: doc.title, html });
+    if (block) throw new CrawlBlockedError(block);
+    return doc;
+  }
+
   const FACULTIES = [
     { id: "1", name: "מדעי היהדות", slug: "jewish-studies" },
     { id: "2", name: "מדעי הרוח", slug: "humanities" },
@@ -186,6 +266,50 @@
         showInteractiveDialog();
       };
     }
+  }
+
+  function downloadJson(data, fileName) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+  }
+
+  // Deliberately has no "try again" button: the user is told to stop.
+  function showBlockedBanner(block, partialResult = null, partialFileName = null) {
+    abortRequested = true;
+    const hasData = !!(partialResult && partialResult.rows.length > 0);
+    if (hasData) downloadJson(partialResult, partialFileName);
+
+    const banner = createBanner();
+    banner.style.borderColor = '#ef4444';
+    banner.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <span style="font-weight:800;font-size:16px;color:#ef4444;">⛔ הסריקה נעצרה</span>
+        <button id="crawler-banner-close" style="background:transparent;border:none;color:#94a3b8;font-size:22px;cursor:pointer;padding:0 4px;line-height:1;">&times;</button>
+      </div>
+      <div id="crawler-block-msg" style="color:#f1f5f9;font-size:13px;line-height:1.6;margin-bottom:10px;white-space:pre-line;"></div>
+      <div id="crawler-block-reason" style="color:#94a3b8;font-size:11px;word-break:break-all;margin-bottom:12px;"></div>
+      ${hasData ? `
+        <button id="crawler-partial-btn" style="width:100%;padding:10px;background:#1e293b;border:1px solid #475569;color:#e2e8f0;border-radius:10px;font-weight:700;cursor:pointer;font-size:13px;">
+          ⬇️ הורד שוב את מה שנאסף (${partialResult.rows.length} שורות)
+        </button>
+      ` : ''}
+    `;
+    // Server-controlled text (the redirect URL) goes in via textContent, never innerHTML.
+    document.getElementById('crawler-block-msg').textContent = hasData
+      ? `${BLOCK_MESSAGE_HE}\nהקובץ ${partialFileName} הורד למחשב.`
+      : BLOCK_MESSAGE_HE.replace(' הנתונים שנאספו עד כה נשמרו.', ' לא נאספו נתונים לפני החסימה.');
+    document.getElementById('crawler-block-reason').textContent = `סיבה: ${block.reason} — ${block.detail}`;
+
+    document.getElementById('crawler-banner-close').onclick = () => banner.remove();
+    const partialBtn = document.getElementById('crawler-partial-btn');
+    if (partialBtn) partialBtn.onclick = () => downloadJson(partialResult, partialFileName);
+    console.error(`[BIU Crawler] ${formatBlockMessage(block, hasData ? partialFileName : null)}`);
   }
 
   function showCompletionBanner(finalResult, outputFileName) {
@@ -389,6 +513,20 @@
       return;
     }
 
+    const sections = {};
+    const details = {};
+    let uniqueTuples = [];
+    let pairSet = new Set();
+    let detectedDept = targetMeta.name || '';
+    let detectedFaculty = '';
+
+    function stopWithPartialResult(err) {
+      if (!(err instanceof CrawlBlockedError)) throw err;
+      const partial = buildResult(false);
+      partial.result.meta.stopped_by_block = err.block;
+      showBlockedBanner(err.block, partial.result, partial.fileName.replace('-full-', '-partial-'));
+    }
+
     let currentDoc = initialDoc;
     let hasMore = true;
 
@@ -433,15 +571,16 @@
       if (vsg) formData.append('__VIEWSTATEGENERATOR', vsg);
 
       await sleep(DELAY_MS);
-      const res = await fetch('https://courses.biu.ac.il/CoursesView.aspx', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: formData.toString()
-      });
-
-      const nextHtml = await res.text();
-      const parser = new DOMParser();
-      currentDoc = parser.parseFromString(nextHtml, 'text/html');
+      try {
+        currentDoc = await fetchChecked('https://courses.biu.ac.il/CoursesView.aspx', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: formData.toString()
+        });
+      } catch (err) {
+        stopWithPartialResult(err);
+        return;
+      }
       pageNum++;
     }
 
@@ -457,15 +596,10 @@
       }
     }
 
-    const uniqueTuples = Array.from(tupleMap.entries());
-    const pairSet = new Set(allRows.map((r) => `${r.code}|${r.semester}`));
-
-    const sections = {};
-    const details = {};
+    uniqueTuples = Array.from(tupleMap.entries());
+    pairSet = new Set(allRows.map((r) => `${r.code}|${r.semester}`));
 
     let count = 0;
-    let detectedDept = targetMeta.name || '';
-    let detectedFaculty = '';
 
     for (const [tupleKey, row] of uniqueTuples) {
       count++;
@@ -474,10 +608,7 @@
       await sleep(DELAY_MS);
 
       try {
-        const dRes = await fetch(`CourseDetails.aspx?lid=${lid}`);
-        const dHtml = await dRes.text();
-        const parser = new DOMParser();
-        const dDoc = parser.parseFromString(dHtml, 'text/html');
+        const dDoc = await fetchChecked(`CourseDetails.aspx?lid=${lid}`);
 
         function getField(lblOrArray) {
           const labels = Array.isArray(lblOrArray) ? lblOrArray : [lblOrArray];
@@ -585,60 +716,71 @@
           details[pairKey] = secData;
         }
       } catch (err) {
+        if (err instanceof CrawlBlockedError) {
+          stopWithPartialResult(err);
+          return;
+        }
         console.error(`Error fetching lid ${lid}:`, err);
       }
     }
 
-    // Determine slug
-    let targetSlug = targetMeta.slug;
-    if (!targetSlug) {
-      const matchDept = DEPARTMENTS.find(d => d.name === detectedDept);
-      if (matchDept) targetSlug = matchDept.slug;
-      else {
-        const matchFac = FACULTIES.find(f => f.name === detectedFaculty);
-        if (matchFac) targetSlug = matchFac.slug;
-        else targetSlug = 'courses';
-      }
-    }
-
-    const outputFileName = `biu-${yr}-${targetSlug}-full-${dateStr}.json`;
-
-    // 3. Final JSON compilation
-    const isComplete =
-      allRows.length === reportedTotal &&
-      Object.keys(sections).length === uniqueTuples.length &&
-      Object.keys(details).length === pairSet.size;
-
-    const finalResult = {
-      meta: {
-        schema: 2,
-        year: yr,
-        target_type: targetMeta.type || 'detected',
-        target_id: targetMeta.id || null,
-        target_name: detectedDept || targetMeta.name || null,
-        faculty: detectedFaculty || null,
-        label: `${yr}-${targetSlug}`,
-        scraped_at: new Date().toISOString(),
-        source: 'https://courses.biu.ac.il/CoursesView.aspx',
-        reported_total: reportedTotal,
-        captured: allRows.length,
-        pages_walked: Object.keys(rowsPerPage).length,
-        page_size: 20,
-        rows_per_page: rowsPerPage,
-        detail_sections_expected: uniqueTuples.length,
-        detail_sections_captured: Object.keys(sections).length,
-        detail_pairs_expected: pairSet.size,
-        detail_pairs_captured: Object.keys(details).length,
-        delay_ms: DELAY_MS,
-        complete: isComplete
-      },
-      rows: allRows,
-      sections: sections,
-      details: details
-    };
-
-    // Show completion dashboard
+    const { result: finalResult, fileName: outputFileName } = buildResult(true);
     showCompletionBanner(finalResult, outputFileName);
+
+    // Builds the output JSON from whatever has been collected; `finished` is false for a partial result.
+    function buildResult(finished) {
+
+      // Determine slug
+      let targetSlug = targetMeta.slug;
+      if (!targetSlug) {
+        const matchDept = DEPARTMENTS.find(d => d.name === detectedDept);
+        if (matchDept) targetSlug = matchDept.slug;
+        else {
+          const matchFac = FACULTIES.find(f => f.name === detectedFaculty);
+          if (matchFac) targetSlug = matchFac.slug;
+          else targetSlug = 'courses';
+        }
+      }
+
+      const outputFileName = `biu-${yr}-${targetSlug}-full-${dateStr}.json`;
+
+      // 3. Final JSON compilation
+      const isComplete =
+        finished &&
+        allRows.length === reportedTotal &&
+        Object.keys(sections).length === uniqueTuples.length &&
+        Object.keys(details).length === pairSet.size;
+
+      const finalResult = {
+        meta: {
+          schema: 2,
+          year: yr,
+          target_type: targetMeta.type || 'detected',
+          target_id: targetMeta.id || null,
+          target_name: detectedDept || targetMeta.name || null,
+          faculty: detectedFaculty || null,
+          label: `${yr}-${targetSlug}`,
+          scraped_at: new Date().toISOString(),
+          source: 'https://courses.biu.ac.il/CoursesView.aspx',
+          reported_total: reportedTotal,
+          captured: allRows.length,
+          pages_walked: Object.keys(rowsPerPage).length,
+          page_size: 20,
+          rows_per_page: rowsPerPage,
+          detail_sections_expected: uniqueTuples.length,
+          detail_sections_captured: Object.keys(sections).length,
+          detail_pairs_expected: pairSet.size,
+          detail_pairs_captured: Object.keys(details).length,
+          delay_ms: DELAY_MS,
+          complete: isComplete
+        },
+        rows: allRows,
+        sections: sections,
+        details: details
+      };
+
+      return { result: finalResult, fileName: outputFileName };
+    }
   }
 
   /**
@@ -651,6 +793,12 @@
    */
   async function performBackgroundSearchAndCrawl({ year, dept, faculty }) {
     abortRequested = false;
+    // The tab itself already shows a CAPTCHA or block page: stop before sending anything.
+    const liveBlock = detectBlock({ title: document.title });
+    if (liveBlock) {
+      showBlockedBanner(liveBlock);
+      return;
+    }
     updateStatus('מבצע חיפוש נתונים מהשרת...', 'טוען קטלוג קורסים...', true);
 
     let targetDoc = null;
@@ -660,10 +808,12 @@
     } else {
       // We are on CoursesView.aspx or another page - fetch fresh root search page
       try {
-        const homeRes = await fetch('https://courses.biu.ac.il/', { credentials: 'include' });
-        const homeHtml = await homeRes.text();
-        targetDoc = new DOMParser().parseFromString(homeHtml, 'text/html');
+        targetDoc = await fetchChecked('https://courses.biu.ac.il/', { credentials: 'include' });
       } catch (e) {
+        if (e instanceof CrawlBlockedError) {
+          showBlockedBanner(e.block);
+          return;
+        }
         console.warn('Could not fetch root page viewstate, falling back to document inputs', e);
         targetDoc = document;
       }
@@ -689,15 +839,17 @@
         if (curVsg) advForm.append('__VIEWSTATEGENERATOR', curVsg);
         advForm.append('ctl00$ContentPlaceHolder1$btnAdvanceSearch', 'חיפוש מתקדם');
 
-        const advRes = await fetch('https://courses.biu.ac.il/', {
+        targetDoc = await fetchChecked('https://courses.biu.ac.il/', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: advForm.toString(),
           credentials: 'include'
         });
-        const advHtml = await advRes.text();
-        targetDoc = new DOMParser().parseFromString(advHtml, 'text/html');
       } catch (advErr) {
+        if (advErr instanceof CrawlBlockedError) {
+          showBlockedBanner(advErr.block);
+          return;
+        }
         console.warn('Failed to toggle advanced search:', advErr);
       }
     }
@@ -760,23 +912,17 @@
     }
 
     try {
-      const res = await fetch('https://courses.biu.ac.il/', {
+      let resultsDoc = await fetchChecked('https://courses.biu.ac.il/', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: formData.toString(),
         credentials: 'include'
       });
 
-      const html = await res.text();
-      const parser = new DOMParser();
-      let resultsDoc = parser.parseFromString(html, 'text/html');
-
       let table = resultsDoc.getElementById('ContentPlaceHolder1_gvLessons');
       if (!table) {
         // Fallback: check if server redirected to CoursesView.aspx
-        const resView = await fetch('https://courses.biu.ac.il/CoursesView.aspx', { credentials: 'include' });
-        const viewHtml = await resView.text();
-        const viewDoc = parser.parseFromString(viewHtml, 'text/html');
+        const viewDoc = await fetchChecked('https://courses.biu.ac.il/CoursesView.aspx', { credentials: 'include' });
         if (viewDoc.getElementById('ContentPlaceHolder1_gvLessons')) {
           resultsDoc = viewDoc;
           table = viewDoc.getElementById('ContentPlaceHolder1_gvLessons');
@@ -790,6 +936,10 @@
 
       await crawlFromDocument(resultsDoc, targetMeta);
     } catch (err) {
+      if (err instanceof CrawlBlockedError) {
+        showBlockedBanner(err.block);
+        return;
+      }
       console.error('Search request failed:', err);
       showErrorBanner('שגיאה בתקשורת', err.message);
     }
@@ -1012,6 +1162,11 @@
   window.crawlBIU = async function({ year = '2027', dept = null, faculty = null } = {}) {
     const isResultsPage = window.location.href.includes('CoursesView.aspx') && !!document.getElementById('ContentPlaceHolder1_gvLessons');
     if (!dept && !faculty && isResultsPage) {
+      const liveBlock = detectBlock({ title: document.title });
+      if (liveBlock) {
+        showBlockedBanner(liveBlock);
+        return;
+      }
       await crawlFromDocument(document, { year });
       return;
     }

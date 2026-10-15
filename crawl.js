@@ -10,6 +10,13 @@ const {
   resolveTarget,
   formatCatalogDirectory
 } = require('./catalog-meta');
+const {
+  detectBlock,
+  isBiuUrl,
+  CrawlBlockedError,
+  probePuppeteerPage,
+  reportBlockedCrawl
+} = require('./block-detect');
 
 const DEFAULT_DELAY_MS = 1500;
 const DEFAULT_YEAR = '2027';
@@ -117,24 +124,46 @@ async function main() {
     process.exit(1);
   }
 
-  const pages = await browser.pages();
-  // Filter out any captcha pages or non-biu pages
-  let page = null;
-  for (const p of pages) {
-    if (p.url().includes('courses.biu.ac.il')) {
-      const title = await p.title().catch(() => '');
-      if (!title.toLowerCase().includes('captcha')) {
-        page = p;
-        break;
-      }
-    }
+  // Everything collected so far; saved as a checkpoint if the site blocks us mid-crawl.
+  const allRows = [];
+  const rowsPerPage = {};
+  const sections = {};
+  const details = {};
+  let checkpointFile = null;
+
+  function stopIfBlocked(probe) {
+    const block = detectBlock(probe);
+    if (!block) return;
+    reportBlockedCrawl(block, checkpointFile, {
+      meta: {
+        source: 'https://courses.biu.ac.il/CoursesView.aspx',
+        captured: allRows.length,
+        rows_per_page: rowsPerPage,
+        detail_sections_captured: Object.keys(sections).length,
+        delay_ms: options.delay
+      },
+      rows: allRows,
+      sections,
+      details
+    });
+    throw new CrawlBlockedError(block);
   }
 
-  if (!page) {
+  const pages = await browser.pages();
+  const coursePages = pages.filter((p) => isBiuUrl(p.url()));
+  if (coursePages.length === 0) {
     throw new Error('Courses page not found on port 9222! Please open courses.biu.ac.il in Chrome first.');
   }
 
+  // A tab already showing a CAPTCHA or block page means the site is pushing back: stop.
+  for (const p of coursePages) {
+    stopIfBlocked({ url: p.url(), title: await p.title().catch(() => '') });
+  }
+  const page = coursePages[0];
+  const checkNavigation = async (response) => stopIfBlocked(await probePuppeteerPage(page, response));
+
   console.log('Attached to page:', page.url());
+  await checkNavigation(null);
 
   // Check if currently on a valid results page
   const currentStatus = await page.evaluate(() => {
@@ -201,18 +230,19 @@ async function main() {
   // If a specific target was chosen and we need to perform the search
   if (target.type !== 'custom') {
     console.log(`Navigating to search page and selecting target...`);
-    await page.goto('https://courses.biu.ac.il/', { waitUntil: 'networkidle2' });
+    await checkNavigation(await page.goto('https://courses.biu.ac.il/', { waitUntil: 'networkidle2' }));
 
     if (target.type === 'faculty') {
       // Check if faculty dropdown is visible; if not, open advanced search
       const hasFac = await page.evaluate(() => !!document.getElementById('ContentPlaceHolder1_cmbFaculties'));
       if (!hasFac) {
-        await Promise.all([
+        const [advResponse] = await Promise.all([
           page.waitForNavigation({ waitUntil: 'networkidle2' }),
           page.evaluate(() => {
             document.getElementById('ContentPlaceHolder1_btnAdvanceSearch').click();
           })
         ]);
+        await checkNavigation(advResponse);
         await page.waitForSelector('#ContentPlaceHolder1_cmbFaculties', { timeout: 10000 });
       }
 
@@ -237,12 +267,13 @@ async function main() {
     }
 
     // Submit search
-    await Promise.all([
+    const [searchResponse] = await Promise.all([
       page.waitForNavigation({ waitUntil: 'networkidle2' }),
       page.evaluate(() => {
         document.getElementById('ContentPlaceHolder1_btnSearch').click();
       })
     ]);
+    await checkNavigation(searchResponse);
     await sleep(options.delay);
   }
 
@@ -253,7 +284,7 @@ async function main() {
 
   if (activePageNum !== '1') {
     console.log(`Current page is ${activePageNum}, returning to Page 1...`);
-    await Promise.all([
+    const [firstPageResponse] = await Promise.all([
       page.waitForNavigation({ waitUntil: 'networkidle2' }),
       page.evaluate(() => {
         const a1 = Array.from(document.querySelectorAll('tr.cssPager a')).find(
@@ -268,6 +299,7 @@ async function main() {
         }
       })
     ]);
+    await checkNavigation(firstPageResponse);
     await sleep(options.delay);
   }
 
@@ -291,12 +323,11 @@ async function main() {
   const defaultOutputFile = path.join(__dirname, `biu-${year}-${targetSlug}-full-${todayStr}.json`);
   const OUTPUT_FILE = options.output ? path.resolve(options.output) : defaultOutputFile;
   const CHECKPOINT_FILE = path.join(__dirname, `checkpoint-${targetSlug}.json`);
+  checkpointFile = CHECKPOINT_FILE;
 
   console.log(`Output file will be: ${OUTPUT_FILE}`);
   console.log(`Checkpoint file: ${CHECKPOINT_FILE}`);
 
-  const allRows = [];
-  const rowsPerPage = {};
   let currentPage = 1;
 
   // Extract real course rows (ignoring pager row)
@@ -398,7 +429,7 @@ async function main() {
     }, nextTarget);
 
     if (canNavigateNext) {
-      await page.waitForNavigation({ waitUntil: 'networkidle2' });
+      await checkNavigation(await page.waitForNavigation({ waitUntil: 'networkidle2' }));
       await sleep(options.delay);
       currentPage++;
     } else {
@@ -439,8 +470,6 @@ async function main() {
 
   // Fetch Section Details
   console.log('\n--- Fetching Section Details ---');
-  const sections = {};
-  const details = {};
 
   let count = 0;
   let detectedDept = target.name;
@@ -452,11 +481,18 @@ async function main() {
     process.stdout.write(`[${count}/${uniqueTuples.length}] Fetching LID ${lid} (${row.code} - ${row.name})... `);
 
     try {
-      const secData = await page.evaluate(async (lId) => {
-        const res = await fetch(`CourseDetails.aspx?lid=${lId}`);
-        const html = await res.text();
+      const { probe, secData } = await page.evaluate(async (lId) => {
+        let res;
+        let html;
+        try {
+          res = await fetch(`CourseDetails.aspx?lid=${lId}`);
+          html = await res.text();
+        } catch (fetchErr) {
+          return { probe: { fetchError: String(fetchErr) } };
+        }
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, 'text/html');
+        const probe = { status: res.status, url: res.url, title: doc.title, html };
 
         function getField(lblOrArray) {
           const labels = Array.isArray(lblOrArray) ? lblOrArray : [lblOrArray];
@@ -514,7 +550,7 @@ async function main() {
         const campus = getField('קמפוס') || '';
         const location = [building, room].filter(Boolean).join(' / ') || classroom || '';
 
-        return {
+        return { probe, secData: {
           points: getField('נ"ז') || '',
           code: getField('קוד קורס') || '',
           hours: getField('שעות') || '',
@@ -535,8 +571,9 @@ async function main() {
           remark: getField('הערה') || '',
           clusters: getField('אפיונים') || '',
           syllabus: `CourseSylabusView.aspx?lid=${lId}`
-        };
+        } };
       }, lid);
+      stopIfBlocked(probe);
 
       // Backfill classroom into row if row was empty
       if (!row.building && secData.building) row.building = secData.building;
@@ -556,6 +593,7 @@ async function main() {
 
       console.log(`OK (terms: ${secData.terms.length})`);
     } catch (err) {
+      if (err instanceof CrawlBlockedError) throw err;
       console.log(`ERROR: ${err.message}`);
     }
 
@@ -642,6 +680,8 @@ async function main() {
 }
 
 main().catch((err) => {
+  // The stop message and checkpoint were already handled where the block was detected.
+  if (err instanceof CrawlBlockedError) process.exit(2);
   console.error('Crawler failed with error:', err);
   process.exit(1);
 });

@@ -6,7 +6,8 @@
   "scripts": {
     "crawl": "node crawl.js",
     "crawl:list": "node crawl.js --list",
-    "compare": "node compare.js"
+    "compare": "node compare.js",
+    "test": "node --test \"test/**/*.test.js\""
   },
   "keywords": [
     "biu",
