@@ -231,6 +231,7 @@ async function main() {
   if (target.type !== 'custom') {
     console.log(`Navigating to search page and selecting target...`);
     await checkNavigation(await page.goto('https://courses.biu.ac.il/', { waitUntil: 'networkidle2' }));
+    await sleep(options.delay);
 
     if (target.type === 'faculty') {
       // Check if faculty dropdown is visible; if not, open advanced search
@@ -243,6 +244,7 @@ async function main() {
           })
         ]);
         await checkNavigation(advResponse);
+        await sleep(options.delay);
         await page.waitForSelector('#ContentPlaceHolder1_cmbFaculties', { timeout: 10000 });
       }
 

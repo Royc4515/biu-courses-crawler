@@ -66,6 +66,7 @@ async function main() {
   if (!status.hasTable || status.count !== 515) {
     console.log('Not on CS 515 results page. Navigating to root and searching...');
     await checkNavigation(await page.goto('https://courses.biu.ac.il/', { waitUntil: 'networkidle2' }));
+    await sleep(DELAY_MS);
     await page.evaluate(() => {
       document.getElementById('ContentPlaceHolder1_cmbYear').value = '2027';
       document.getElementById('ContentPlaceHolder1_cmbDepartments').value = '84';
