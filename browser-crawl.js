@@ -801,6 +801,14 @@
     }
     updateStatus('מבצע חיפוש נתונים מהשרת...', 'טוען קטלוג קורסים...', true);
 
+    // Every search-phase request waits DELAY_MS after the previous one; the first goes out at once.
+    let searchRequestsSent = 0;
+    const pacedFetch = async (url, init) => {
+      if (searchRequestsSent > 0) await sleep(DELAY_MS);
+      searchRequestsSent++;
+      return fetchChecked(url, init);
+    };
+
     let targetDoc = null;
     // Check if current page is the root search form with btnSearch
     if (document.getElementById('ContentPlaceHolder1_btnSearch') || (document.getElementById('ContentPlaceHolder1_cmbDepartments') && !document.getElementById('ContentPlaceHolder1_gvLessons'))) {
@@ -808,7 +816,7 @@
     } else {
       // We are on CoursesView.aspx or another page - fetch fresh root search page
       try {
-        targetDoc = await fetchChecked('https://courses.biu.ac.il/', { credentials: 'include' });
+        targetDoc = await pacedFetch('https://courses.biu.ac.il/', { credentials: 'include' });
       } catch (e) {
         if (e instanceof CrawlBlockedError) {
           showBlockedBanner(e.block);
@@ -839,7 +847,7 @@
         if (curVsg) advForm.append('__VIEWSTATEGENERATOR', curVsg);
         advForm.append('ctl00$ContentPlaceHolder1$btnAdvanceSearch', 'חיפוש מתקדם');
 
-        targetDoc = await fetchChecked('https://courses.biu.ac.il/', {
+        targetDoc = await pacedFetch('https://courses.biu.ac.il/', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: advForm.toString(),
@@ -912,7 +920,7 @@
     }
 
     try {
-      let resultsDoc = await fetchChecked('https://courses.biu.ac.il/', {
+      let resultsDoc = await pacedFetch('https://courses.biu.ac.il/', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: formData.toString(),
@@ -922,7 +930,7 @@
       let table = resultsDoc.getElementById('ContentPlaceHolder1_gvLessons');
       if (!table) {
         // Fallback: check if server redirected to CoursesView.aspx
-        const viewDoc = await fetchChecked('https://courses.biu.ac.il/CoursesView.aspx', { credentials: 'include' });
+        const viewDoc = await pacedFetch('https://courses.biu.ac.il/CoursesView.aspx', { credentials: 'include' });
         if (viewDoc.getElementById('ContentPlaceHolder1_gvLessons')) {
           resultsDoc = viewDoc;
           table = viewDoc.getElementById('ContentPlaceHolder1_gvLessons');

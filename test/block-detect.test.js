@@ -219,3 +219,16 @@ describe('browser-crawl.js stays in sync', () => {
     assert.equal(region(browser), region(shared));
   });
 });
+
+describe('browser-crawl.js search phase pacing', () => {
+  test('every search request goes through pacedFetch', () => {
+    const browser = fs.readFileSync(path.join(__dirname, '..', 'browser-crawl.js'), 'utf8');
+    const m = browser.match(/async function performBackgroundSearchAndCrawl[\s\S]*?await crawlFromDocument\(/);
+    assert.ok(m, 'performBackgroundSearchAndCrawl missing');
+    const body = m[0];
+    assert.match(body, /if \(searchRequestsSent > 0\) await sleep\(DELAY_MS\);/);
+    const calls = body.match(/await pacedFetch\(/g) || [];
+    assert.equal(calls.length, 4);
+    assert.doesNotMatch(body, /await fetchChecked\(/);
+  });
+});
