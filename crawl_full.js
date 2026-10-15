@@ -1,6 +1,12 @@
 const fs = require('fs');
 const path = require('path');
 const puppeteer = require('puppeteer-core');
+const {
+  detectBlock,
+  CrawlBlockedError,
+  probePuppeteerPage,
+  reportBlockedCrawl
+} = require('./block-detect');
 
 const DELAY_MS = 1500;
 const OUTPUT_FILE = path.join(__dirname, 'biu-2027-cs-full-2026-10-14.json');
@@ -12,14 +18,41 @@ const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 async function main() {
   console.log('Connecting to browser on port 9222...');
   const browser = await puppeteer.connect({ browserURL: 'http://127.0.0.1:9222' });
+  // Everything collected so far; saved as a checkpoint if the site blocks us mid-crawl.
+  const allRows = [];
+  const rowsPerPage = {};
+  const sections = {};
+  const details = {};
+
+  function stopIfBlocked(probe) {
+    const block = detectBlock(probe);
+    if (!block) return;
+    reportBlockedCrawl(block, CHECKPOINT_FILE, {
+      meta: {
+        label: '2027-cs',
+        source: 'https://courses.biu.ac.il/CoursesView.aspx',
+        captured: allRows.length,
+        rows_per_page: rowsPerPage,
+        detail_sections_captured: Object.keys(sections).length,
+        delay_ms: DELAY_MS
+      },
+      rows: allRows,
+      sections,
+      details
+    });
+    throw new CrawlBlockedError(block);
+  }
+
   const pages = await browser.pages();
   const page = pages.find((p) => p.url().includes('courses.biu.ac.il'));
 
   if (!page) {
     throw new Error('Courses page not found on port 9222!');
   }
+  const checkNavigation = async (response) => stopIfBlocked(await probePuppeteerPage(page, response));
 
   console.log('Attached to page:', page.url());
+  await checkNavigation(null);
 
   // Check if we are on results page with 515 courses
   const status = await page.evaluate(() => {
@@ -32,17 +65,18 @@ async function main() {
 
   if (!status.hasTable || status.count !== 515) {
     console.log('Not on CS 515 results page. Navigating to root and searching...');
-    await page.goto('https://courses.biu.ac.il/', { waitUntil: 'networkidle2' });
+    await checkNavigation(await page.goto('https://courses.biu.ac.il/', { waitUntil: 'networkidle2' }));
     await page.evaluate(() => {
       document.getElementById('ContentPlaceHolder1_cmbYear').value = '2027';
       document.getElementById('ContentPlaceHolder1_cmbDepartments').value = '84';
     });
-    await Promise.all([
+    const [searchResponse] = await Promise.all([
       page.waitForNavigation({ waitUntil: 'networkidle2' }),
       page.evaluate(() => {
         document.getElementById('ContentPlaceHolder1_btnSearch').click();
       })
     ]);
+    await checkNavigation(searchResponse);
     await sleep(DELAY_MS);
   }
 
@@ -53,7 +87,7 @@ async function main() {
 
   if (activePageNum !== '1') {
     console.log(`Current page is ${activePageNum}, returning to Page 1...`);
-    await Promise.all([
+    const [firstPageResponse] = await Promise.all([
       page.waitForNavigation({ waitUntil: 'networkidle2' }),
       page.evaluate(() => {
         const a1 = Array.from(document.querySelectorAll('tr.cssPager a')).find(
@@ -69,6 +103,7 @@ async function main() {
         }
       })
     ]);
+    await checkNavigation(firstPageResponse);
     await sleep(DELAY_MS);
   }
 
@@ -79,8 +114,6 @@ async function main() {
   });
   console.log(`Reported total courses: ${reportedTotal}`);
 
-  const allRows = [];
-  const rowsPerPage = {};
   let currentPage = 1;
 
   // Extract real course rows (ignoring pager row)
@@ -150,7 +183,7 @@ async function main() {
     }, nextTarget);
 
     if (canNavigateNext) {
-      await page.waitForNavigation({ waitUntil: 'networkidle2' });
+      await checkNavigation(await page.waitForNavigation({ waitUntil: 'networkidle2' }));
       await sleep(DELAY_MS);
       currentPage++;
     } else {
@@ -191,8 +224,6 @@ async function main() {
 
   // Fetch Section Details
   console.log('\n--- Fetching Section Details ---');
-  const sections = {};
-  const details = {};
 
   let count = 0;
   for (const [tupleKey, row] of uniqueTuples) {
@@ -201,11 +232,18 @@ async function main() {
     process.stdout.write(`[${count}/${uniqueTuples.length}] Fetching LID ${lid} (${row.code} - ${row.name})... `);
 
     try {
-      const secData = await page.evaluate(async (lId) => {
-        const res = await fetch(`CourseDetails.aspx?lid=${lId}`);
-        const html = await res.text();
+      const { probe, secData } = await page.evaluate(async (lId) => {
+        let res;
+        let html;
+        try {
+          res = await fetch(`CourseDetails.aspx?lid=${lId}`);
+          html = await res.text();
+        } catch (fetchErr) {
+          return { probe: { fetchError: String(fetchErr) } };
+        }
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, 'text/html');
+        const probe = { status: res.status, url: res.url, title: doc.title, html };
 
         function getField(lbl) {
           const allEls = Array.from(doc.querySelectorAll('td, th, span, div, label, b, strong'));
@@ -253,7 +291,7 @@ async function main() {
           }
         }
 
-        return {
+        return { probe, secData: {
           points: getField('נ"ז') || '',
           code: getField('קוד קורס') || '',
           hours: getField('שעות') || '',
@@ -269,8 +307,9 @@ async function main() {
           remark: getField('הערה') || '',
           clusters: getField('אפיונים') || '',
           syllabus: `CourseSylabusView.aspx?lid=${lId}`
-        };
+        } };
       }, lid);
+      stopIfBlocked(probe);
 
       sections[lid] = secData;
 
@@ -282,6 +321,7 @@ async function main() {
 
       console.log(`OK (terms: ${secData.terms.length})`);
     } catch (err) {
+      if (err instanceof CrawlBlockedError) throw err;
       console.log(`ERROR: ${err.message}`);
     }
 
@@ -361,6 +401,8 @@ async function main() {
 }
 
 main().catch((err) => {
+  // The stop message and checkpoint were already handled where the block was detected.
+  if (err instanceof CrawlBlockedError) process.exit(2);
   console.error('Crawler failed with error:', err);
   process.exit(1);
 });
