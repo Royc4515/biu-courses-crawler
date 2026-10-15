@@ -754,6 +754,7 @@
         rows: new Array(138).fill({ code: '89-201-01', title: 'מבני נתונים ואלגוריתמים' }),
         sections: new Array(138).fill(true)
       };
+      const dateStr = new Date().toISOString().split('T')[0];
       showCompletionBanner(mockResult, `biu-${year}-${targetMeta.slug || 'cs'}-full-${dateStr}.json`);
       return;
     }

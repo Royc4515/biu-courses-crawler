@@ -55,9 +55,15 @@
 
 <div align="center">
 
-![סרטון הדגמה חי של הסורק באתר בר אילן](./assets/crawler-guide.webp)
+<video src="./assets/crawler-guide.mp4" poster="./assets/browser-console-ui.png" controls autoplay loop muted playsinline width="100%" style="border-radius: 14px; box-shadow: 0 14px 40px rgba(0,0,0,0.65); max-width: 920px; display: block; margin: 0 auto;">
+  <img src="./assets/crawler-guide.webp" alt="הדגמת וידאו של סורק הקורסים" width="100%" />
+</video>
 
-*הדגמת וידאו מונפשת: הפעלת הסורק, בחירת מחלקה ומעקב אחר התקדמות הסריקה בזמן אמת*
+<br/>
+
+![הדגמת וידאו מונפשת](./assets/crawler-guide.webp)
+
+*🎬 הדגמת וידאו מלאה (60fps MP4 / Animated WebP): הפעלת הסורק, סינון מהיר של מחלקת מדעי המחשב, סריקת עמודים רציפה והעתקת JSON*
 
 </div>
 
